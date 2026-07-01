@@ -7,16 +7,22 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
  * Validates signature, prevents duplicates, and credits user accounts.
  *
  * Expected Capsbit Postback Parameters:
- * - user_id: The user ID passed to the offer
  * - transId: Unique transaction identifier from Capsbit
- * - payout: Points earned
- * - status: "successful" or other status values
+ * - user_id: The user ID passed to the offer
+ * - payout: Publisher payout amount
+ * - reward: Reward name/type
+ * - reward_value: Points to credit (if exists, use this; otherwise calculate from payout)
+ * - reward_name: Name of the reward
+ * - status: "approved" or "1" for valid conversions
  * - userip: User's IP address
  * - country: User's country code
  * - offer_id: The offer/campaign ID
  * - offer_name: The offer name
  * - offer_type: The offer type/category
- * - signature: HMAC signature for verification
+ * - signature: MD5 signature for verification
+ *
+ * Signature Verification:
+ * Expected signature = MD5(user_id + payout + offer_id + transId + SECRET_KEY)
  */
 
 const corsHeaders = {
@@ -24,6 +30,9 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+// Capsbit Secret Key for signature verification
+const CAPSBIT_SECRET_KEY = "469c8d5b186be1bc3fcf177ccc4c5c39";
 
 // Helper to get real IP from request
 function getClientIP(req: Request): string | null {
@@ -38,6 +47,14 @@ function getClientIP(req: Request): string | null {
 function isValidUUID(uuid: string): boolean {
   const regex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   return regex.test(uuid);
+}
+
+// Generate MD5 hash using Deno's built-in buffer
+async function md5(message: string): Promise<string> {
+  const msgBuffer = new TextEncoder().encode(message);
+  const hashBuffer = await crypto.subtle.digest("MD5", msgBuffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
 // Get Supabase client (using service role for full access)
@@ -103,9 +120,10 @@ Deno.serve(async (req: Request) => {
     console.log(`[Capsbit Postback] Raw params:`, rawPayload);
 
     // Extract Capsbit parameters
-    const userId = params.user_id;
     const transId = params.transId;
+    const userId = params.user_id;
     const payoutStr = params.payout;
+    const rewardValueStr = params.reward_value;
     const status = params.status;
     const userip = params.userip;
     const country = params.country;
@@ -115,22 +133,19 @@ Deno.serve(async (req: Request) => {
     const signature = params.signature;
 
     // Validate required fields
-    if (!userId) {
-      console.error(`[Capsbit Postback] Missing user_id`);
-      return new Response(JSON.stringify({
-        success: false,
-        error: "Missing user_id parameter"
-      }), {
-        status: 400,
-        headers: { ...corsHeaders, "Content-Type": "application/json" }
-      });
-    }
+    const missingParams: string[] = [];
+    if (!transId) missingParams.push("transId");
+    if (!userId) missingParams.push("user_id");
+    if (!payoutStr) missingParams.push("payout");
+    if (!offerId) missingParams.push("offer_id");
+    if (!signature) missingParams.push("signature");
 
-    if (!transId) {
-      console.error(`[Capsbit Postback] Missing transId`);
+    if (missingParams.length > 0) {
+      console.error(`[Capsbit Postback] Missing parameters:`, missingParams.join(", "));
       return new Response(JSON.stringify({
         success: false,
-        error: "Missing transId parameter"
+        error: "Missing required parameters",
+        missing: missingParams
       }), {
         status: 400,
         headers: { ...corsHeaders, "Content-Type": "application/json" }
@@ -148,22 +163,52 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // Parse payout
-    let payout = parseFloat(payoutStr) || 0;
-    if (payout <= 0) {
-      console.error(`[Capsbit Postback] Invalid payout: ${payoutStr}`);
+    // Verify signature
+    // Expected: MD5(user_id + payout + offer_id + transId + SECRET_KEY)
+    const expectedSignatureInput = userId + payoutStr + offerId + transId + CAPSBIT_SECRET_KEY;
+    const expectedSignature = await md5(expectedSignatureInput);
+
+    if (signature.toLowerCase() !== expectedSignature.toLowerCase()) {
+      console.error(`[Capsbit Postback] Invalid signature. Expected: ${expectedSignature}, Got: ${signature}`);
       return new Response(JSON.stringify({
         success: false,
-        error: "Invalid payout amount"
+        error: "Invalid signature"
       }), {
         status: 400,
         headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     }
 
-    // Only process successful conversions
-    if (status !== "successful" && status !== "success" && status !== "1" && status !== "approved") {
-      console.log(`[Capsbit Postback] Skipping non-successful status: ${status}`);
+    // Parse amounts
+    const payout = parseFloat(payoutStr) || 0;
+    const rewardValue = rewardValueStr ? parseFloat(rewardValueStr) : null;
+
+    // Determine points to credit
+    // If reward_value exists, use it; otherwise use payout
+    let pointsToCredit: number;
+    if (rewardValue !== null && rewardValue > 0) {
+      pointsToCredit = Math.round(rewardValue);
+    } else {
+      pointsToCredit = Math.round(payout);
+    }
+
+    if (pointsToCredit <= 0) {
+      console.error(`[Capsbit Postback] Invalid points: payout=${payout}, reward_value=${rewardValue}`);
+      return new Response(JSON.stringify({
+        success: false,
+        error: "Invalid amount - could not determine points to credit"
+      }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+
+    // Only process approved conversions
+    const statusLower = status?.toLowerCase();
+    const isApproved = statusLower === "approved" || status === "1";
+
+    if (!isApproved) {
+      console.log(`[Capsbit Postback] Skipping non-approved status: ${status}`);
       return new Response(JSON.stringify({
         success: false,
         status: "skipped",
@@ -174,7 +219,7 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    console.log(`[Capsbit Postback] Processing: user=${userId}, transId=${transId}, payout=${payout}`);
+    console.log(`[Capsbit Postback] Processing: user=${userId}, transId=${transId}, points=${pointsToCredit}, offer=${offerName || offerId}`);
 
     const supabase = await getSupabaseClient();
 
@@ -182,13 +227,13 @@ Deno.serve(async (req: Request) => {
     const { data, error } = await supabase.rpc("process_capsbit_postback", {
       p_transaction_id: transId,
       p_user_id: userId,
-      p_amount: payout,
+      p_amount: pointsToCredit,
       p_ip_address: userip || clientIP,
       p_raw_payload: rawPayload,
-      p_offer_id: offerId || null,
+      p_offer_id: offerId,
       p_offer_name: offerName || null,
       p_offer_type: offerType || null,
-      p_country: country || null,
+      p_country: country || null
     });
 
     if (error) {
@@ -207,7 +252,7 @@ Deno.serve(async (req: Request) => {
     const processingTime = Date.now() - startTime;
 
     if (result.success) {
-      console.log(`[Capsbit Postback] SUCCESS: ${result.message || 'Processed'} - user=${userId}, points=+${result.points_earned}, time=${processingTime}ms`);
+      console.log(`[Capsbit Postback] SUCCESS: user=${userId}, points=+${result.points_earned}, time=${processingTime}ms`);
       return new Response(JSON.stringify({
         success: true,
         status: result.status,
@@ -221,7 +266,7 @@ Deno.serve(async (req: Request) => {
         headers: { ...corsHeaders, "Content-Type": "application/json" }
       });
     } else {
-      console.log(`[Capsbit Postback] DUPLICATE/INVALID: ${result.status} - user=${userId}, txid=${transId}`);
+      console.log(`[Capsbit Postback] ${result.status?.toString().toUpperCase()}: ${result.message?.toString() || 'Not processed'} - user=${userId}`);
       return new Response(JSON.stringify({
         success: false,
         status: result.status,
